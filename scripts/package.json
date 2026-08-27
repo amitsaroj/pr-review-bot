@@ -1,0 +1,11 @@
+{
+  "name": "pr-review-bot",
+  "version": "1.0.0",
+  "description": "Automatically reviews GitHub pull requests targeting main using Claude.",
+  "main": "pr-review.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "@octokit/rest": "^21.0.0"
+  }
+}

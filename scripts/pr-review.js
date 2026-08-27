@@ -1,0 +1,212 @@
+/**
+ * Automatic PR Reviewer
+ * ----------------------
+ * Triggered by .github/workflows/pr-review.yml on every PR opened/updated
+ * against "main". Pulls the full diff, sends it to Claude for review, and
+ * posts a structured comment back on the pull request.
+ */
+
+const { Octokit } = require("@octokit/rest");
+const Anthropic = require("@anthropic-ai/sdk");
+
+// ---------------------------------------------------------------------------
+// CONFIG — tune these to fit your team's workflow
+// ---------------------------------------------------------------------------
+const CONFIG = {
+  // Files whose diffs are skipped entirely (lockfiles, generated code, etc.)
+  ignoredPatterns: [
+    /package-lock\.json$/,
+    /yarn\.lock$/,
+    /pnpm-lock\.yaml$/,
+    /\.min\.js$/,
+    /dist\//,
+    /build\//,
+    /vendor\//,
+    /\.generated\./,
+  ],
+
+  // Skip reviewing any single file whose patch is larger than this
+  // (keeps token usage sane on huge auto-generated diffs)
+  maxPatchCharsPerFile: 20000,
+
+  // Hard cap on total diff size sent to Claude across all files
+  maxTotalDiffChars: 120000,
+
+  // Model used for review
+  model: "claude-sonnet-4-5",
+
+  // Max tokens for the review response
+  maxTokens: 4000,
+};
+
+// ---------------------------------------------------------------------------
+
+const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const owner = process.env.REPO_OWNER;
+const repo = process.env.REPO_NAME;
+const pullNumber = Number(process.env.PR_NUMBER);
+
+function isIgnored(filename) {
+  return CONFIG.ignoredPatterns.some((pattern) => pattern.test(filename));
+}
+
+async function getPrDiff() {
+  const { data: files } = await octokit.pulls.listFiles({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    per_page: 100,
+  });
+
+  const included = [];
+  const skipped = [];
+  let totalChars = 0;
+
+  for (const file of files) {
+    if (isIgnored(file.filename)) {
+      skipped.push(`${file.filename} (ignored pattern)`);
+      continue;
+    }
+    if (!file.patch) {
+      // Binary files, renames with no changes, etc.
+      skipped.push(`${file.filename} (no text diff available)`);
+      continue;
+    }
+    if (file.patch.length > CONFIG.maxPatchCharsPerFile) {
+      skipped.push(`${file.filename} (diff too large: ${file.patch.length} chars)`);
+      continue;
+    }
+    if (totalChars + file.patch.length > CONFIG.maxTotalDiffChars) {
+      skipped.push(`${file.filename} (total diff budget exceeded)`);
+      continue;
+    }
+
+    totalChars += file.patch.length;
+    included.push({
+      filename: file.filename,
+      status: file.status,
+      additions: file.additions,
+      deletions: file.deletions,
+      patch: file.patch,
+    });
+  }
+
+  return { included, skipped };
+}
+
+function buildPrompt(pr, files) {
+  const diffBlock = files
+    .map(
+      (f) =>
+        `### File: ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})\n\`\`\`diff\n${f.patch}\n\`\`\``
+    )
+    .join("\n\n");
+
+  return `You are an experienced senior software engineer performing a pull request code review.
+
+PR Title: ${pr.title}
+PR Description: ${pr.body || "(no description provided)"}
+Base branch: ${pr.base.ref}
+Head branch: ${pr.head.ref}
+
+Review the following diff carefully. Look for:
+- Bugs, logic errors, and edge cases
+- Security vulnerabilities
+- Code style / best practice violations
+- Missing or inadequate tests
+- Missing documentation for non-trivial changes
+- Performance concerns
+
+Diff:
+${diffBlock}
+
+Respond in the following Markdown format exactly, with no extra commentary before or after:
+
+## PR Review Summary
+
+**Verdict:** <one of: "✅ Looks good" | "⚠️ Needs changes" | "🔴 Blocking issues">
+
+<1-3 sentence overview of the PR and overall assessment>
+
+## File-by-File Notes
+
+### <filename>
+- <finding or note>
+- <finding or note>
+
+(repeat per file that has notes; skip files with no issues, or write "No issues found." if a file was reviewed and is clean)
+
+## Suggested Fixes Checklist
+
+- [ ] <actionable item>
+- [ ] <actionable item>
+
+(if there is nothing to fix, write "- [x] No action items — PR is ready to merge.")
+`;
+}
+
+async function callClaude(prompt) {
+  const response = await anthropic.messages.create({
+    model: CONFIG.model,
+    max_tokens: CONFIG.maxTokens,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  return response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+async function postReviewComment(reviewBody, skippedFiles) {
+  let body = reviewBody;
+
+  if (skippedFiles.length > 0) {
+    body += `\n\n<details>\n<summary>Files skipped in this review (${skippedFiles.length})</summary>\n\n${skippedFiles
+      .map((f) => `- ${f}`)
+      .join("\n")}\n\n</details>`;
+  }
+
+  body += `\n\n---\n*Automated review generated by Claude. This does not replace human review.*`;
+
+  await octokit.issues.createComment({
+    owner,
+    repo,
+    issue_number: pullNumber,
+    body,
+  });
+}
+
+async function main() {
+  console.log(`Reviewing PR #${pullNumber} on ${owner}/${repo}...`);
+
+  const { data: pr } = await octokit.pulls.get({
+    owner,
+    repo,
+    pull_number: pullNumber,
+  });
+
+  const { included, skipped } = await getPrDiff();
+
+  if (included.length === 0) {
+    await postReviewComment(
+      "## PR Review Summary\n\n**Verdict:** ✅ Looks good\n\nNo reviewable text diffs were found in this PR (all changed files were ignored, binary, or empty).",
+      skipped
+    );
+    console.log("No reviewable files. Posted a no-op summary.");
+    return;
+  }
+
+  const prompt = buildPrompt(pr, included);
+  const review = await callClaude(prompt);
+  await postReviewComment(review, skipped);
+
+  console.log("Review posted successfully.");
+}
+
+main().catch((err) => {
+  console.error("PR review failed:", err);
+  process.exit(1);
+});
